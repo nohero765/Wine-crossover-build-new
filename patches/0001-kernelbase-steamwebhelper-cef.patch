@@ -1,0 +1,115 @@
+Subject: [PATCH] kernelbase: CROSSOVER HACK 13322/17315/21883 - steamwebhelper CEF flags
+
+Re-adds the Steam web-helper command-line hack that CodeWeavers carried in the
+CX20-era Wine 4/5 tree and dropped by the time of CrossOver 26's Wine 11.0.
+Verified absent from crossover-sources-26.3.0 and 26.1.0: neither
+hack_append_command_line nor "steamwebhelper" appears anywhere in dlls/.
+
+Without it, steamwebhelper.exe starts with GPU compositing enabled, CEF fails to
+present through winemac.drv, and the Steam login window paints black while the
+DOM stays live and clickable. Chromium then latches
+gpu.hardware_acceleration_mode.enabled=false into htmlcache/Local State, which is
+why the failure is permanent after the first launch.
+
+Reconstructed from riverfog7/macports-wine (branch "patches"), files
+  0004-kernelbase-HACK-Add-hack_append_command_line.diff
+  0005-kernelbase-CW-HACK-13322-17315-21883.diff
+and rebased onto CrossOver 26's dlls/kernelbase/process.c, whose
+CreateProcessInternalW already carries CW Hack 24938 (Epic) and CW Hack
+24920/24557 (powershell) between the app_name resolution and the
+"Warn if unsupported features" block.
+
+Two deliberate differences from the macports originals:
+  * the allocation is sized from lstrlenW(tidy_cmdline), not lstrlenW(cmd_line).
+    The originals size from cmd_line but copy tidy_cmdline, which is longer in
+    the app_name-without-cmd_line case (it gets quoted) - a heap overflow.
+  * hack_append_command_line() also returns early when cmd_line is NULL, so the
+    forbidden_args wcsstr() can never dereference NULL.
+
+The Battle.net entry from 1001-kernelbase-CW-HACK-19610.diff is deliberately not
+included; it is unrelated to Steam.
+
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -498,6 +498,46 @@
+     RtlFreeUnicodeString( &desktopW );
+     RtlFreeUnicodeString( &titleW );
+     return ret;
++}
++
++static const WCHAR *hack_append_command_line( const WCHAR *cmd, const WCHAR *cmd_line )
++{
++    /* CROSSOVER HACK: bug 13322 (winehq bug 39403)
++     * Insert --no-sandbox in command line of Steam's web helper process to
++     * work around rendering problems.
++     * CROSSOVER HACK: bug 17315
++     * Insert --in-process-gpu in command line of Steam's web helper process to
++     * work around page rendering problems.
++     * CROSSOVER HACK: bug 21883
++     * Insert --disable-gpu as well.
++     */
++
++    static const struct
++    {
++        const WCHAR *exe_name;
++        const WCHAR *append;
++        const WCHAR *required_args;
++        const WCHAR *forbidden_args;
++    }
++    options[] =
++    {
++        {L"steamwebhelper.exe", L" --no-sandbox --in-process-gpu --disable-gpu", NULL, L"--type=crashpad-handler"},
++    };
++    unsigned int i;
++
++    if (!cmd || !cmd_line) return NULL;
++
++    for (i = 0; i < ARRAY_SIZE(options); ++i)
++    {
++        if (wcsstr( cmd, options[i].exe_name )
++            && (!options[i].required_args || wcsstr(cmd_line, options[i].required_args))
++            && (!options[i].forbidden_args || !wcsstr(cmd_line, options[i].forbidden_args)))
++        {
++            FIXME( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
++            return options[i].append;
++        }
++    }
++    return NULL;
+ }
+ 
+ /**********************************************************************
+@@ -516,6 +556,7 @@
+     RTL_USER_PROCESS_PARAMETERS *params = NULL;
+     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
+     HANDLE parent = 0, debug = 0;
++    const WCHAR *append;
+     ULONG nt_flags = 0;
+     USHORT machine = 0;
+     NTSTATUS status;
+@@ -564,9 +605,26 @@
+             FIXME("HACK: not starting powershell.exe.\n");
+             SetLastError( ERROR_FILE_NOT_FOUND );
+             return FALSE;
++        }
++    }
++
++    /* CROSSOVER HACK: bug 13322, 17315, 21883 */
++    if ((append = hack_append_command_line( app_name, tidy_cmdline )))
++    {
++        WCHAR *new_cmdline = RtlAllocateHeap( GetProcessHeap(), 0,
++                                              sizeof(WCHAR) * (lstrlenW(tidy_cmdline) + lstrlenW(append) + 1) );
++        if (new_cmdline)
++        {
++            lstrcpyW(new_cmdline, tidy_cmdline);
++            lstrcatW(new_cmdline, append);
++            if (tidy_cmdline != cmd_line) RtlFreeHeap( GetProcessHeap(), 0, tidy_cmdline );
++            tidy_cmdline = new_cmdline;
+         }
+     }
++    /* end CROSSOVER HACK */
+ 
++    TRACE( "app %s cmdline %s after all hacks\n", debugstr_w(app_name), debugstr_w(tidy_cmdline) );
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |
