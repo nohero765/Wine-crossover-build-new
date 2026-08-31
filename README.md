@@ -10,6 +10,8 @@ before CX26. See [The Steam CEF hack](#the-steam-cef-hack).
 Replaces the old `CROSSOVER sources/my wine build script/` pipeline, which built vanilla
 WineHQ and hand-applied ~20 CrossOver patches from a third-party macports repo.
 
+only to be used with the truckersmp for macOS launcher made by nohero765 aka me
+
 ## Files
 
 | File | What it is |
